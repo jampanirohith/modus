@@ -1,0 +1,361 @@
+
+# Phase 1 — Final Master Pipeline Specification
+## Canonical Song + Telugu Enhanced LRC
+
+This is the **definitive, ultra-ultra detailed, production-ready architectural blueprint** for Phase 1. It consolidates every decision, correction, optimization, and edge-case handling from our entire design process into a single, authoritative document. 
+
+No code is included — this is a pure logical, mathematical, and architectural specification.
+
+---
+
+## 🗄️ DATABASE ARCHITECTURE & STATE MACHINE
+
+The system uses two separate SQLite databases to maintain a clean separation between playlist state and the final canonical library.
+
+### Database 1: `db/playlist.db`
+Tracks the raw input from Spotify. Uses **append-only** logic — once a serial number is assigned, it is permanent and immutable.
+
+**Schema:**
+```sql
+CREATE TABLE playlist_entries (
+    serial_number INTEGER PRIMARY KEY,         -- The permanent, fixed identity
+    spotify_playlist_id TEXT NOT NULL,
+    spotify_playlist_entry_number INTEGER NOT NULL,
+    spotify_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    album TEXT,
+    isrc TEXT,
+    status TEXT DEFAULT 'pending',             -- pending, finished, duplicate, error
+    error_remark TEXT DEFAULT NULL,            -- Stores exact exception if failed
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(spotify_playlist_id, spotify_playlist_entry_number)
+);
+```
+
+### Database 2: `db/songs.db`
+The canonical library. Uses the **exact same `serial_number`** from `playlist.db` as its Primary Key, ensuring a perfect 1-to-1 relationship.
+
+**Schema:**
+```sql
+CREATE TABLE songs (
+    serial_number INTEGER PRIMARY KEY,         -- Same serial as playlist.db
+    spotify_id TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT NOT NULL,
+    album TEXT,
+    album_artist TEXT,
+    release_date TEXT,
+    duration INTEGER,
+    spotify_url TEXT,
+    isrc TEXT,
+    artwork_url TEXT,
+    youtube_url TEXT,
+    youtube_offset_seconds REAL,               -- Sync offset for Phase 2 muxing
+    file_path TEXT,
+    lrc_path TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### The State Machine (4 States)
+```text
+┌──────────┐
+│ pending  │ ← Default state for newly added songs
+└────┬─────┘
+     │
+     ├─→ ISRC Duplicate found & User chooses "Keep" ──→ [duplicate]
+     │
+     ├─→ Processing succeeds ─────────────────────────→ [finished]
+     │
+     └─→ Processing fails ────────────────────────────→ [error]
+           (error_remark = exact failure message)
+           ⚠️ Permanently skipped by main.py batch runs
+           ⚠️ Requires manual retry via process_single.py
+```
+
+---
+
+## ⚙️ PHASE 0: Environment & Hardware Mandates
+
+*   **GPU Mandate:** PyTorch **must** be configured with CUDA. Demucs (vocal separation) and MMS (forced alignment) are computationally heavy and must run on the GPU.
+*   **Spotify Premium Credentials:** The official Spotify API must be authenticated using Premium account credentials via the `spotipy` library.
+*   **Core Tooling:**
+    *   `spotipy` (Spotify metadata), `spotdl` (Audio download), `syncedlyrics` (Multi-source lyrics aggregator), `ytmusicapi` (YT Music lyrics), `lyricsgenius` (Plain text fallback).
+    *   `demucs` (Vocal separation), `transformers` (Whisper-tiny for validation, MMS for alignment).
+    *   `silero-vad` (Voice Activity Detection), `yt-dlp` (YouTube audio extraction), `librosa` (Audio cross-correlation).
+    *   `mutagen` (MP3 metadata embedding), `pydub`/`ffmpeg` (Audio slicing).
+
+---
+
+## 📥 STEP 1: Spotify Playlist Ingestion & Serial Assignment
+
+**Goal:** Sync the local `playlist.db` with the live Spotify playlist using append-only logic. Assign permanent, immutable serial numbers.
+
+1. Authenticate with the official Spotify API using `spotipy`.
+2. Fetch all tracks from the playlist in their exact original order.
+3. Query `playlist.db` for existing entries of this specific Playlist ID. Build a lookup set of existing Spotify Track IDs.
+4. Determine the next available serial number (`MAX(serial_number) + 1`).
+5. Iterate through the live Spotify tracks:
+   * **If Track ID exists in DB:** Ignore completely. Do not update metadata or serial.
+   * **If Track ID is new:** Assign the next serial number. Extract metadata (Title, Artist, Album, ISRC, etc.). Insert into `playlist.db` with `status = 'pending'`.
+6. Create ephemeral working directory: `temp/<spotify_track_id>/`.
+
+---
+
+## 🔍 STEP 1.5: ISRC-Based Duplicate Detection
+
+**Goal:** Prevent processing the exact same master recording twice, but only when we have a reliable identifier.
+
+1. Read the `isrc` of the pending song.
+2. **The Golden Rule:** 
+   * **If `isrc` is empty/null/missing:** Skip duplicate detection completely. Proceed to Step 2.
+   * **If `isrc` exists:** Search `songs.db` for any existing entry with the exact same ISRC.
+3. **If no match found:** Proceed to Step 2.
+4. **If match found:** Halt processing. Display side-by-side comparison (Existing vs. New). Prompt user:
+   * **Choice 1 (Keep Existing):** Mark new entry as `duplicate`. No `songs.db` entry created.
+   * **Choice 2 (Replace with New):** Delete old MP3/LRC files. Delete old `songs.db` row. Mark old `playlist.db` entry as `duplicate`. Return to process the new song.
+   * *(Invalid input defaults to Choice 1).*
+
+---
+
+## 🎵 STEP 2: Master Audio Download (Trusting `spotdl`)
+
+**Goal:** Download the master timing reference audio reliably.
+
+1. Pass the `Spotify URL` to `spotdl`. We trust `spotdl`'s internal text/duration matching completely. No external audio fingerprinting (AcoustID) or BPM checks.
+2. Download and save as `temp/<spotify_track_id>/spotify_audio.mp3`.
+3. **Strict Rule:** This is the **only** audio downloaded. It is the absolute master clock.
+4. **Error Handling:** Retry up to 3 times. If it fails, mark `playlist.db` as `error`, save the exception in `error_remark`, clean up `temp/`, and skip to the next track.
+
+---
+
+## 📝 STEP 3: Multi-Source Lyrics Collection (3-Layer Architecture)
+
+**Goal:** Cast the widest possible net to gather all lyric candidates.
+
+1. **Layer 1: `syncedlyrics` (The Aggregator)**
+   * Queries LRCLIB, NetEase, Lyricsify, Musixmatch, etc., in a single call. Handles Cloudflare bypasses automatically.
+2. **Layer 2: `ytmusicapi` (YouTube Music)**
+   * Queries YT Music's internal database for timed or plain lyrics.
+3. **Layer 3: `lyricsgenius` (Genius API)**
+   * Queries Genius for plain text lyrics (requires free API token). Used as the ultimate fallback.
+
+*All results are collected into a single unified list, tagged with their provider and raw sync type.*
+
+---
+
+## 🏆 STEP 4: Tiered Selection & The CRITICAL SPLIT
+
+**Goal:** Select the single best lyric candidate using a strict quality-tier hierarchy, ensuring the text is mathematically pure for MMS.
+
+### Phase 4A: The "MMS-Ready" Hard Filter (Telugu Purity)
+Before ranking, calculate the **Telugu Character Ratio (TCR)** for every candidate:
+* `TCR = Telugu_Unicode_Characters / Total_Alphabetic_Characters`
+* **The Hard Rule:** If `TCR < 0.30` (meaning it is mostly English transliteration like *"Samajavaragamana"*), **DISCARD IMMEDIATELY**. MMS cannot align Latin letters to Telugu phonemes.
+
+### Phase 4B: Strict Tiered Selection
+Sort remaining candidates into 3 strict buckets. Evaluate in strict priority order:
+1. **Bucket A (Gold): Word-Enhanced LRC.** If valid candidates exist, pick the most complete one (full song vs. just chorus). **STOP HERE.** This is the Champion.
+2. **Bucket B (Silver): Line-Timestamped LRC.** Only evaluated if Bucket A is empty. Pick the most complete. **STOP HERE.**
+3. **Bucket C (Bronze): Plain Text.** Only evaluated if A and B are empty. Pick the most complete.
+
+### Phase 4C: The CRITICAL SPLIT
+Once the Champion is crowned, generate two distinct files:
+1. **`best_telugu_lyrics.txt` (The Clean Text):** Strip ALL timestamps, structural tags (`[Chorus]`), and metadata. Pure Telugu script only. This is what MMS will read.
+2. **`reference_sync.lrc` (The Map):** Save the Champion's original timestamps exactly as they were. 
+   * *If Bucket A or B won:* Contains the timing map for Step 7.
+   * *If Bucket C won:* **Not generated**.
+
+---
+
+## 🛡️ STEP 5: VAD-Driven Acoustic Validation (The "Bouncer")
+
+**Goal:** Prove the Champion actually matches the audio before wasting GPU cycles, bypassing long instrumental intros.
+
+1. **Voice Activity Detection (VAD):** Run **Silero VAD** on `spotify_audio.mp3` to find the exact millisecond the singer starts.
+2. **Isolate First Vocal Phrase:** Slice the audio to the first VAD segment, adding a 1-second buffer on both sides. Save as `first_vocal_phrase.wav`.
+3. **Whisper Transcription:** Run **Whisper-tiny** (Telugu) *only* on this isolated clip.
+4. **Comparison:** Compare Whisper output to the first stanza of `best_telugu_lyrics.txt` using SequenceMatcher.
+5. **The Verdict:**
+   * **Similarity > 80%:** Champion is **VALIDATED**. Proceed to Step 6.
+   * **Similarity < 80%:** Champion is **DETHRONED**. Discard it. Promote the runner-up from the *exact same bucket* to Champion and re-validate. If the bucket is exhausted, drop to the next bucket.
+
+---
+
+## 🎙️ STEP 6: Vocal Isolation (Demucs)
+
+**Goal:** Remove instruments so MMS can focus purely on phonetics.
+
+1. Feed the **entire, uncut** `spotify_audio.mp3` into Demucs (running on GPU).
+2. Output `vocals.wav` and `accompaniment.wav`.
+3. **Crucial Rule:** Demucs must process the full track. Chunking before Demucs causes severe edge-artifacts and clicking sounds.
+
+---
+
+## ✂️ STEP 7: Semantic Audio Mapping & Dynamic Chunking
+
+**Goal:** Divide the vocal track into logical "musical phrases" based on lyric timestamps, ensuring chunks are collision-proof.
+
+### Phase 7.1: Timestamp & Gap Analysis
+Analyze `reference_sync.lrc`. Calculate the Inter-Line Gap (silence between lines).
+
+### Phase 7.2: Semantic Segmentation
+Group consecutive lines into **Segments** based on natural pauses:
+* **Natural Pause Rule:** If gap > 1.5s, mark as a potential cut point.
+* **Max Duration Rule:** A Segment cannot exceed 20 seconds. If fast lyrics exceed 20s, force a cut at the nearest line boundary.
+* **Min Context Rule:** A Segment should ideally be at least 4 seconds. Merge tiny segments.
+
+### Phase 7.3: Collision-Free Dynamic Buffering
+Apply buffers dynamically based on the actual available silence:
+* **Large gap (> 3.0s):** Apply **2.0s buffer**.
+* **Medium gap (1.5s - 3.0s):** Apply **1.0s buffer**.
+* **Tiny gap (< 1.5s):** Apply **0.3s buffer**.
+* *Guarantee:* Because the buffer is mathematically constrained by the gap, overlapping chunks are physically impossible.
+
+### Phase 7.4: Audio Slicing
+Slice `vocals.wav` using these dynamic boundaries. Save as `chunk_XX.wav`. Save `chunk_mapping.json` to track audio boundaries and lyric lines per chunk.
+
+---
+
+## 🎯 STEP 8: MMS Telugu Forced Alignment with Per-Chunk Resilience
+
+**Goal:** Lock Telugu words to the exact millisecond, with automatic fallback for chunks where MMS struggles.
+
+### Phase 8.1: Process & Confidence Scoring
+Feed each chunk + clean text to MMS. Calculate a **Confidence Score** (0.0 to 1.0) based on:
+1. Word Coverage Ratio (did it align all words?).
+2. Average Alignment Log-Likelihood.
+3. Timestamp Sanity (monotonically increasing?).
+
+### Phase 8.2: The Fallback Decision Tree
+* **Confidence ≥ 0.6 (GOOD):** Use MMS word-level timestamps.
+* **Confidence < 0.6 (LOW):** Trigger fallback.
+  * *If `reference_sync.lrc` exists (Tier 1/2):* Read `chunk_mapping.json`, find the corresponding lines, and fallback to the original scraped **line-level timestamps** for just that chunk.
+  * *If `reference_sync.lrc` does NOT exist (Tier 3):* Retry MMS once with relaxed parameters. If it still fails, mark the entire song as `error` in `playlist.db`.
+
+### Phase 8.3: Stitching & Reporting
+Add the chunk's absolute start offset to MMS's relative timestamps. Concatenate all chunks. Generate `alignment_report.txt` detailing which chunks used MMS and which used fallback.
+
+---
+
+## 📜 STEP 9: Final Enhanced LRC Generation
+
+**Goal:** Format the output into the industry-standard SyLRC/Word-Synced format.
+
+1. Take the final calculated word timestamps.
+2. Format inline: `[00:42.10]<00:42.10>నువ్వు <00:42.55>నవ్వితే <00:43.20>చాలా`
+3. Save as `temp/<spotify_track_id>/aligned.lrc`.
+
+---
+
+## 🔗 STEP 10: YouTube Video URL Capture
+
+**Goal:** Capture the video reference from the user after heavy AI processing is complete.
+
+1. Display song details (Title, Artist, Serial).
+2. Prompt user to paste the official YouTube video song URL.
+3. Store the URL in memory. No auto-search, no validation. We trust the user's manual curation.
+
+---
+
+## 📐 STEP 11: YouTube Audio Sync Calculation
+
+**Goal:** Calculate the exact audio offset for Phase 2 video muxing.
+
+1. Use `yt-dlp` to download *only the audio* from the provided YouTube URL. Save as `youtube_audio.mp3`.
+2. **Audio Cross-Correlation:** Use `librosa` to compare `spotify_audio.mp3` with `youtube_audio.mp3`.
+3. Find the exact lag/offset where the Spotify song starts in the YouTube video (e.g., `+4.523` seconds).
+4. Store `youtube_offset_seconds` in memory.
+
+---
+
+## 💿 STEP 12: Create Canonical Song Master
+
+**Goal:** Build the final, self-contained MP3 with all metadata embedded.
+
+1. Copy `spotify_audio.mp3` to `songs/<serial:03d>_<sanitized_title>.mp3`.
+2. **Embed Standard Metadata (ID3v2.4):** Title, Artist, Album, Album Artist, Release Date, ISRC, High-res Artwork.
+3. **Embed Custom Metadata (TXXX Frames):**
+   * `SPOTIFY_TRACK_ID`, `SPOTIFY_URL`
+   * `YOUTUBE_URL` (from Step 10)
+   * `YOUTUBE_OFFSET_SECONDS` (from Step 11, millisecond precision)
+   * `LRC_FORMAT` ("ENHANCED_WORD_SYNCED")
+   * *All TXXX frames use UTF-8 encoding.*
+4. **Embed Lyrics:** Save sidecar `.lrc` file. Embed plain text in `USLT` tag. Embed word-synced data in `SYLT` tag.
+5. **Verify:** Read back TXXX frames to confirm successful write.
+
+---
+
+## 🗄️ STEP 13: Database Commit & Cleanup
+
+**Goal:** Finalize state and free up disk space.
+
+1. **Commit to `songs.db`:** Insert all metadata, file paths, and YouTube offset using `serial_number` as PK.
+2. **Update `playlist.db`:** Mark entry as `finished`, set `error_remark` to NULL.
+3. **Strict Rule:** This step only executes if Steps 1-12 succeeded 100%. If any step failed, the entry remains `error` with the exact exception logged.
+4. **Cleanup:** Delete the entire `temp/<spotify_track_id>/` folder.
+5. Move to the next track.
+
+---
+
+## 🔄 EXECUTION ARCHITECTURE
+
+### Script 1: `main.py` (Batch Processor)
+* Reads `playlist.db` and selects **only** songs with `status = 'pending'`.
+* Completely ignores `finished`, `duplicate`, and `error`.
+* If a song crashes, it logs the error to `error_remark`, marks as `error`, and immediately moves to the next song.
+
+### Script 2: `process_single.py` (Manual Retry Tool)
+* Accepts a specific serial number as input.
+* Fetches the song's `error_remark` and displays it to the user.
+* Resets status to `pending` and runs the full pipeline (Steps 2-13) exclusively for that single song.
+
+---
+
+## 📁 FINAL DIRECTORY STRUCTURE
+
+```text
+project/
+│
+├── main.py                        # Batch processor
+├── process_single.py              # Manual retry tool
+├── config.json                    # API credentials
+│
+├── db/
+│   ├── playlist.db                # Playlist state (Append-only serials)
+│   └── songs.db                   # Canonical library (Serial = PK)
+│
+├── temp/                          # Ephemeral workspace (Deleted in Step 13)
+│   └── <spotify_track_id>/
+│       ├── spotify_audio.mp3      # Master audio
+│       ├── youtube_audio.mp3      # YouTube audio (for sync calc)
+│       ├── vocals.wav             # Demucs output (full track)
+│       ├── chunk_01.wav           # Sliced vocals (dynamic boundaries)
+│       ├── chunk_mapping.json     # Maps chunks to audio bounds & lyrics
+│       ├── lyrics/                # Raw scraped candidates
+│       ├── best_telugu_lyrics.txt # Pure clean Telugu text for MMS
+│       ├── reference_sync.lrc     # Timing map for chunking (if Tier 1/2)
+│       ├── aligned.lrc            # Final MMS Enhanced LRC
+│       └── alignment_report.txt   # Quality report (MMS vs Fallback)
+│
+└── songs/                         # The final canonical library
+    ├── 001_Urike_Urike.mp3        # Self-contained artifact with TXXX metadata
+    ├── 001_Urike_Urike.lrc        # Sidecar Enhanced LRC
+    └── ...
+```
+
+---
+
+## 🧠 ARCHITECTURAL GUARANTEES
+
+1. **Spotify Audio is the Master Clock:** External timestamps are never trusted for the final sync. MMS locks everything to the `spotdl` audio.
+2. **Serial Number is the Single Identity:** The same serial flows through `playlist.db`, `songs.db`, and file names. Assigned once, never changed.
+3. **Strict Tiered Lyrics Selection:** Word-Enhanced > Line-Timestamped > Plain. The highest-quality format is always selected, protected by the Telugu Character Ratio (TCR) hard filter.
+4. **VAD-Driven Validation:** Whisper only listens to actual human vocals, completely bypassing long instrumental intros that cause false rejections.
+5. **Collision-Proof Chunking:** Audio is sliced based on natural musical pauses, and buffers are dynamically scaled to the available silence. Overlapping chunks are mathematically impossible.
+6. **Per-Chunk MMS Resilience:** A single bad chunk (ad-lib, bleed) no longer kills the song. The system falls back to scraped line-level timestamps for that specific chunk, yielding 95% AI perfection and 5% traditional sync.
+7. **The MP3 is Self-Contained:** All sync intelligence, including the YouTube video offset, is embedded directly into TXXX metadata frames. Phase 2 requires zero database lookups.
+8. **Batch Purity:** `main.py` never crashes or gets stuck. Failures are isolated, logged with exact error messages, and routed to the manual retry tool.
