@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+*.egg-info/
+.DS_Store
+Thumbs.db
+
+# Runtime/generated data
+db/*.db
+db/*.db-shm
+db/*.db-wal
+temp/*
+models/mms/*
+songs/final/*
+
+# Keep project placeholders
+!db/.gitkeep
+!temp/.gitkeep
+!models/mms/.gitkeep
+!songs/final/.gitkeep
+
+songs/*

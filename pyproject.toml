@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phase2-telugu-word-sync"
+version = "1.3.0"
+description = "Standalone Telugu word-level lyric synchronisation pipeline"
+requires-python = ">=3.11,<3.14"
+
+[project.scripts]
+phase2-align = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
