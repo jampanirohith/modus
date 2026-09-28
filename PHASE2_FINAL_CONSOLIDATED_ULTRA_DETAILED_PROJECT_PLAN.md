@@ -1,3 +1,397 @@
+# PHASE 2 — STANDALONE TELUGU WORD-LEVEL LYRIC SYNCHRONISATION
+
+## FINAL CONSOLIDATED ULTRA-DETAILED PROJECT PLAN
+
+**Document status:** FINAL / authoritative consolidated engineering specification  
+**Project:** Phase 2 only — standalone word-level lyric synchronisation  
+**Revision:** 1.4.0 (consolidated after field runs)  
+**Scope:** MP3 + external LRC + cumulative JSON -> final MP3 + final LRC + cumulative JSON  
+**Language:** Telugu (`te` / `tel`)  
+**Primary acoustic model:** Meta MMS (`facebook/mms-1b-all`) with Telugu adapter  
+**Primary alignment method:** reference-driven CTC forced alignment  
+**Original source files:** read-only  
+**Phase 1 integration:** none  
+**Reel / hook selection:** explicitly out of scope and rolled back  
+
+---
+
+# 0. AUTHORITATIVE FINAL DECISIONS / OVERRIDES
+
+This section is the highest-priority specification for the document. It exists because the project evolved through several implementation and field-test iterations. Any older passage later in this document that conflicts with this section is superseded by this section.
+
+## 0.1 Phase boundary
+
+Phase 2 is a separate standalone project. It does not import or call Phase 1 code, Phase 1 databases, or Phase 1 pipeline state. It only consumes files placed in its input directory.
+
+## 0.2 Input package
+
+Every song is a basename-matched package:
+
+```text
+songs/original/
+├── SongName.mp3
+├── SongName.lrc
+└── SongName.json
+```
+
+The external `.lrc` is the lyric/reference/timing source. The `.json` is the cumulative historical/source record. The `.mp3` is the audio and metadata source.
+
+Embedded `SYLT` or `USLT` inside the MP3 is **not required** and is **not** the lyric source of truth. If embedded lyric frames already exist, they are treated as existing MP3 metadata and must be preserved.
+
+## 0.3 Output package
+
+For every completed song, the only user-facing final files are:
+
+```text
+songs/final/
+├── SongName.mp3
+├── SongName.lrc
+└── SongName.json
+```
+
+There is **one** final LRC file per song. Earlier drafts that described three final LRC variants are superseded.
+
+## 0.4 No reel / hook-selection pipeline
+
+Automatic hook selection, manual hook-timeline JSON, reel rendering, smart crop, zoom-to-70%-of-9:16 rendering, and line-highlight reel generation are **not part of this Phase 2 project**. Those ideas were explicitly rolled back and must not be reintroduced into the implementation.
+
+## 0.5 JSON preservation
+
+The input JSON is a cumulative record. The final JSON is produced by deep-copying the entire original JSON and adding/updating only the top-level `phase2` namespace.
+
+No existing top-level key, nested field, source metadata, artwork metadata, playlist metadata, YouTube metadata, Spotify metadata, prior processing record, or unknown field may be silently deleted or reconstructed.
+
+## 0.6 MP3 metadata preservation
+
+The output MP3 starts from the original MP3. Phase 2 must patch metadata surgically.
+
+It must not delete all tags and rebuild a reduced tag set. Existing artwork, identifiers, URLs, TXXX frames, UFID frames, WXXX frames, USLT, existing SYLT, and any other pre-existing metadata are preserved. Phase 2 owns only its own dedicated word-level SYLT frame.
+
+## 0.7 Canonical alignment
+
+The canonical word-level result is the internal Phase 2 alignment model represented in SQLite and the final JSON. The final LRC and MP3 SYLT are exports from that same canonical representation.
+
+Never use the rendered LRC as the canonical timing source.
+
+## 0.8 Actual forced alignment, not plain ASR offsets
+
+MMS is used to generate frame-level acoustic emissions. The supplied LRC reference text is tokenized and explicitly aligned against those emissions by a CTC forced-alignment algorithm.
+
+The following is not acceptable as the final alignment method:
+
+```text
+MMS -> argmax decode -> predicted transcript -> predicted word offsets
+```
+
+The correct flow is:
+
+```text
+LRC reference text
+        +
+MMS frame-level emissions
+        |
+        v
+CTC forced alignment
+        |
+        v
+token spans
+        |
+        v
+word spans
+```
+
+## 0.9 LRC timestamps are coarse anchors
+
+The source LRC timestamps are timing anchors, not immutable final word timestamps. They constrain search regions, guide chunking, identify long lyric-free intervals, and provide an independent validation signal.
+
+## 0.10 Blank markers are structural events, not ordinary words
+
+A source LRC blank timestamp line such as:
+
+```text
+[04:12.82]
+```
+
+is a structural timing marker.
+
+It should strongly influence chunk boundaries and lyric-start constraints.
+
+A word whose **start** occurs inside an explicit blank-marker region is invalid and should trigger re-alignment/review.
+
+A word that starts before a blank marker and whose acoustic/end span extends slightly beyond the marker is not automatically an LRC serialization failure, because the standard LRC export is based on word onset timestamps. Such a crossing must be retained as a quality diagnostic and may be clipped only in derived representations where the semantics explicitly require it. The canonical alignment must not silently invent timing merely to satisfy a serializer.
+
+## 0.11 Global chronology
+
+The canonical sequence must be globally chronological.
+
+Never solve chronology by sorting timestamps independently from their words. Doing so can attach the wrong timestamps to the wrong lyric words.
+
+If chronology is broken:
+
+```text
+identify offending candidate/chunk
+        ->
+resolve duplicate/overlap provenance
+        ->
+retry affected chunk if necessary
+        ->
+merge again
+        ->
+validate again
+```
+
+## 0.12 Windows FFmpeg temporary-file rule
+
+A temporary output path such as:
+
+```text
+source_16k.wav.tmp
+```
+
+must not be passed to FFmpeg without an explicit output format because the final extension is `.tmp`.
+
+The implementation must either:
+
+1. keep `.wav` as the final suffix of the temporary filename, or
+2. explicitly pass `-f wav`.
+
+The production implementation does both where practical.
+
+## 0.13 NVIDIA/CUDA requirement
+
+For the intended production batch, Demucs and MMS must be GPU-first on the NVIDIA GPU. The application must detect the actual PyTorch CUDA capability at startup and must clearly print which device each stage is using.
+
+The project must not silently run hundreds of songs on CPU because a CPU-only PyTorch wheel was accidentally installed.
+
+For the observed Windows machine, the diagnostic failure:
+
+```text
+AssertionError: Torch not compiled with CUDA enabled
+```
+
+means the installed PyTorch build is CPU-only even though `nvidia-smi` can see the GPU. The remediation is to install the CUDA-enabled PyTorch build compatible with the environment and then verify `torch.cuda.is_available()` before starting the batch.
+
+## 0.14 GPU execution policy
+
+Default production policy:
+
+```text
+one GPU worker
+Demucs on CUDA
+release Demucs resources
+MMS on CUDA
+```
+
+Do not launch multiple large MMS/CTC workers concurrently on one 8 GB GPU merely because the CPU has additional cores.
+
+## 0.15 Model cache
+
+The MMS checkpoint is downloaded once into the configured Hugging Face cache/model directory and reused. The 3.86 GB base checkpoint is not supposed to be downloaded once per song.
+
+Windows symlink warnings are a cache efficiency warning, not a GPU failure. Enabling Windows Developer Mode or running the cache operation with appropriate permissions can improve deduplication. The project must not treat that warning as an alignment failure.
+
+## 0.16 Quality state vs pipeline state
+
+Processing state and output quality are separate dimensions.
+
+Example:
+
+```text
+pipeline_status = finished
+quality_status  = needs_review
+```
+
+is valid and means processing completed but timing quality is suspicious.
+
+## 0.17 Final LRC semantics
+
+There is one final LRC file. It is a project-specific word-level LRC export based on the canonical word start times while preserving the original lyric wording.
+
+The canonical millisecond word spans remain available in JSON/SQLite and the embedded SYLT.
+
+---
+
+# 1. FIELD FAILURE HISTORY AND WHAT EACH FAILURE TAUGHT US
+
+This section is part of the final specification because the production architecture was hardened from actual runs rather than hypothetical assumptions.
+
+## 1.1 Failure A — Windows FFmpeg could not choose WAV format
+
+The initial batch repeatedly failed with:
+
+```text
+Unable to choose an output format for ... source_16k.wav.tmp
+use a standard extension for the filename or specify the format manually
+```
+
+This happened for many songs because the decoder wrote a temporary file whose final extension was `.tmp`.
+
+### Permanent fix
+
+The audio decoder must write something equivalent to:
+
+```text
+.source_16k.<pid>.tmp.wav
+```
+
+or invoke FFmpeg with:
+
+```text
+-f wav
+```
+
+and then atomically replace the intended final WAV.
+
+This failure is a common shared-path failure: one decoder bug affected every song, so the correct response was to fix the common audio module rather than special-case songs.
+
+## 1.2 Failure B — CPU-only PyTorch
+
+The Windows environment reported:
+
+```text
+cuda_available = False
+```
+
+and:
+
+```text
+AssertionError: Torch not compiled with CUDA enabled
+```
+
+while:
+
+```text
+nvidia-smi
+```
+
+successfully reported an NVIDIA GeForce RTX 5050 with approximately 8 GB of VRAM.
+
+### Interpretation
+
+The GPU hardware and Windows driver were visible. PyTorch itself was the CPU-only build.
+
+### Permanent design rule
+
+`doctor`, startup checks, and the processing pipeline must distinguish:
+
+```text
+GPU exists at OS/driver level
+```
+
+from:
+
+```text
+PyTorch can actually create CUDA tensors
+```
+
+Both must be true before a CUDA stage is considered GPU-enabled.
+
+## 1.3 Failure C — final SYLT chronology validation
+
+A later run produced:
+
+```text
+MP3_VALIDATION_FAILED: SYLT timestamps are not chronological
+```
+
+for dozens of songs.
+
+### Root cause
+
+Chunk-local alignments could each be locally valid while their merged global sequence contained backward timestamps, particularly around overlapping chunk context and chunk boundaries.
+
+### Permanent fix
+
+The canonical merge layer must enforce global word order before any exporter is called. The final MP3 validator remains as a second defense, not the first place the problem is discovered.
+
+## 1.4 Failure D — LRC chronology validation
+
+After the SYLT-stage problem was tightened, failures moved to:
+
+```text
+LRC_GENERATION_FAILED: timestamps are not globally chronological
+```
+
+### Root cause
+
+The same timing defect was still reaching the LRC renderer, and some repair logic had only covered certain cross-chunk cases.
+
+### Permanent fix
+
+Chronology is now a canonical alignment property. It must be resolved before LRC generation, not patched in the serializer.
+
+## 1.5 Failure E — words crossing explicit LRC blank markers
+
+The next run produced errors such as:
+
+```text
+lyric word crosses blank marker at 272300 ms:
+line 59 word 1 ends at 272760 ms
+```
+
+### Root cause
+
+The previous validation treated the blank marker as if every word end had to be before it. That was too strict because the LRC blank marker is an onset/structure signal and not necessarily a hard acoustic end boundary for a word that began before the marker.
+
+### Permanent fix
+
+Blank-marker semantics are now explicitly divided into:
+
+```text
+word start constraint
+word span diagnostic
+chunk boundary constraint
+instrumental/gap evidence
+```
+
+The serializer must not reject a valid word solely because its end span slightly crosses a structural marker when its onset remains on the correct side.
+
+## 1.6 Failure F — residual same-chunk backward timestamps
+
+Some songs still showed messages such as:
+
+```text
+lyric word timestamps are not globally chronological: 29940 -> 28090
+```
+
+### Root cause
+
+The original repair path concentrated on cross-chunk continuity but did not fully validate the sequence inside an individual chunk.
+
+### Permanent fix
+
+Every chunk receives both:
+
+```text
+intra-chunk chronology validation
+```
+
+and:
+
+```text
+inter-chunk chronology validation
+```
+
+before global merge is accepted.
+
+## 1.7 Failure G — mutable merge state
+
+Repeated merge/retry passes could mutate candidate objects and then reuse already-modified timings.
+
+### Permanent fix
+
+Alignment candidates and chunk results are treated as immutable input to merge operations. Each repair pass constructs new output objects.
+
+---
+
+# 2. FINAL PROJECT SCOPE
+
+The remainder of this document defines the complete implementation blueprint. The full detailed architecture from the earlier engineering plan is preserved below, with the field-tested decisions above taking precedence wherever necessary.
+
+
+
+# 3. FULL DETAILED ENGINEERING PLAN (RETAINED IN FULL)
+
 # PHASE 2 — STANDALONE WORD-LEVEL TELUGU LYRIC SYNCING
 
 ## Ultra-Detailed Production Project Plan
@@ -7260,4 +7654,635 @@ MP3 + LRC + JSON
 ```
 
 with the JSON cumulative and the MP3 metadata-preserving.
+
+
+
+---
+
+# APPENDIX A — FINAL IMPLEMENTATION CHECKLIST
+
+## A.1 Input contract
+
+- [ ] `songs/original/` exists.
+- [ ] Every MP3 has the expected same-basename LRC.
+- [ ] JSON exists for cumulative metadata.
+- [ ] Original files are never modified.
+- [ ] MP3/LRC/JSON hashes are recorded.
+
+## A.2 Windows audio layer
+
+- [ ] FFmpeg path is discovered.
+- [ ] FFprobe path is discovered.
+- [ ] Temporary WAV filename ends in `.wav`, or `-f wav` is explicit.
+- [ ] Output replacement is atomic.
+- [ ] A decoded 16 kHz mono WAV can be reopened.
+
+## A.3 CUDA layer
+
+- [ ] `nvidia-smi` sees the GPU.
+- [ ] `torch.cuda.is_available()` is true.
+- [ ] A CUDA tensor can be created.
+- [ ] The selected GPU name is printed.
+- [ ] Demucs reports CUDA when run.
+- [ ] MMS reports CUDA when run.
+- [ ] CPU fallback policy is explicit rather than silent.
+
+## A.4 Demucs
+
+- [ ] Vocal model loads.
+- [ ] Output duration matches source within configured tolerance.
+- [ ] Lossless working vocal file is produced.
+- [ ] GPU segment size is conservative for an approximately 8 GB card.
+- [ ] OOM retry logic is present.
+
+## A.5 LRC
+
+- [ ] Timestamp formats are parsed correctly.
+- [ ] Blank markers are retained as structural events.
+- [ ] Line order is preserved.
+- [ ] Original lyric wording is preserved.
+- [ ] Source anchor timestamps remain available.
+
+## A.6 Telugu normalization
+
+- [ ] NFC is applied.
+- [ ] Whitespace is normalized.
+- [ ] Number expansion happens before destructive numeric filtering.
+- [ ] Abbreviation handling occurs before punctuation loss where necessary.
+- [ ] Original and normalized forms are both stored.
+- [ ] Word mapping is reversible.
+
+## A.7 Chunking
+
+- [ ] LRC anchors are used.
+- [ ] Blank markers have high boundary priority.
+- [ ] VAD and energy are supporting signals.
+- [ ] Chunks have logical and model-audio intervals.
+- [ ] Overlap context is present.
+- [ ] Chunk boundaries do not silently cross explicit lyric-free regions.
+
+## A.8 MMS
+
+- [ ] Model cache is validated.
+- [ ] Telugu adapter is explicitly loaded.
+- [ ] Model loads once per worker.
+- [ ] Frame emissions are generated.
+- [ ] No final reliance on ASR argmax word offsets exists.
+
+## A.9 CTC
+
+- [ ] Reference tokens are aligned against emissions.
+- [ ] Blank transitions are handled.
+- [ ] Repeated-label transitions are handled correctly.
+- [ ] Token spans are converted to milliseconds.
+- [ ] Path-derived scores are recorded.
+
+## A.10 Merge
+
+- [ ] Candidate objects are not mutated in place across passes.
+- [ ] Overlap duplicates are resolved by provenance.
+- [ ] Same-chunk chronology is checked.
+- [ ] Cross-chunk chronology is checked.
+- [ ] Global chronology is checked.
+- [ ] No blind timestamp sorting is used.
+
+## A.11 Validation
+
+- [ ] `0 <= start < end <= duration` for every valid word.
+- [ ] Word order matches reference order.
+- [ ] Line order matches reference order.
+- [ ] LRC anchor drift is measured.
+- [ ] Low-score tail is measured.
+- [ ] Blank-marker start constraints are checked.
+- [ ] Output LRC and JSON are derived from the same canonical data.
+
+## A.12 JSON
+
+- [ ] Original JSON is deep-copied.
+- [ ] Unknown fields survive.
+- [ ] Only `phase2` is mutated.
+- [ ] Input JSON hash is recorded.
+- [ ] Final JSON content hash excludes the self-referential hash field if such a field is used.
+- [ ] Final byte hash is stored in SQLite.
+
+## A.13 MP3
+
+- [ ] Original file is copied, not transcoded.
+- [ ] Existing metadata is preserved.
+- [ ] Existing SYLT is preserved.
+- [ ] Existing USLT is preserved.
+- [ ] Existing artwork is preserved.
+- [ ] Only the Phase 2 SYLT is added/replaced.
+- [ ] Final MP3 is reopened and revalidated.
+
+## A.14 Recovery
+
+- [ ] Failed chunks can be retried.
+- [ ] Finished songs do not re-run unnecessarily.
+- [ ] Stale states can be recovered.
+- [ ] Temporary artifacts are retained for failures/review.
+- [ ] Final package promotion is atomic/staged.
+
+---
+
+# APPENDIX B — WINDOWS CUDA SETUP REFERENCE
+
+The following is the intended sequence for the observed Windows/NVIDIA environment. Exact wheel availability should always be verified against the pinned project environment before installation.
+
+## B.1 Inspect current PyTorch
+
+```powershell
+python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
+```
+
+## B.2 Confirm driver visibility
+
+```powershell
+nvidia-smi
+```
+
+## B.3 Install the CUDA-enabled PyTorch build
+
+For the project environment used during the field investigation, the intended CUDA wheel family was CUDA 12.8. A typical pinned installation is:
+
+```powershell
+python -m pip uninstall -y torch torchaudio
+python -m pip install torch==2.9.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+```
+
+Do not install a second, conflicting PyTorch package from the normal PyPI index afterward.
+
+## B.4 Verify a real CUDA tensor
+
+```powershell
+python -c "import torch; print(torch.cuda.get_device_name(0)); x=torch.randn(2000,2000,device='cuda'); print(x.device)"
+```
+
+Expected conceptual result:
+
+```text
+NVIDIA GeForce RTX 5050
+cuda:0
+```
+
+## B.5 Verify Phase 2
+
+```powershell
+python main.py --doctor
+```
+
+The doctor output should report CUDA availability and the selected GPU.
+
+## B.6 Monitor while processing
+
+In another PowerShell window:
+
+```powershell
+nvidia-smi -l 1
+```
+
+The goal is to observe GPU memory use and utilization during Demucs and MMS inference.
+
+## B.7 Demucs-specific GPU principle
+
+Demucs selects `cuda` by default when `torch.cuda.is_available()` is true. Its published documentation notes that GPU acceleration requires a CUDA-enabled PyTorch installation and that reducing the segment size can lower GPU memory requirements. See the official Demucs Windows and README documentation:
+
+- https://github.com/facebookresearch/demucs/blob/main/docs/windows.md
+- https://github.com/facebookresearch/demucs/blob/main/README.md
+
+The project uses a conservative segment setting suitable for an approximately 8 GB GPU and records the actual device used.
+
+---
+
+# APPENDIX C — HUGGING FACE MODEL CACHE POLICY
+
+The MMS model is large. The cache is designed to be reused across songs.
+
+Required principles:
+
+```text
+first model load
+    -> download missing files
+    -> cache
+
+later song
+    -> resolve same cached revision
+    -> reuse files
+```
+
+Do not delete the cache between songs.
+
+Do not call a forced network download for each song.
+
+The project should prefer a project-local Hugging Face cache under `models/mms/` when practical so model provenance stays associated with the project.
+
+On Windows, lack of symlink support causes Hugging Face to fall back to a degraded cache layout in which files can be duplicated across snapshots/revisions. Developer Mode or elevated permissions can improve this behavior. See:
+
+- https://huggingface.co/docs/huggingface_hub/main/package_reference/environment_variables
+- https://huggingface.co/docs/hub/local-cache
+
+The warning itself does not indicate a GPU problem.
+
+---
+
+# APPENDIX D — MMS LANGUAGE ADAPTER REQUIREMENT
+
+For MMS, changing the tokenizer language is only part of language selection. The corresponding model adapter must be loaded.
+
+Conceptually:
+
+```python
+processor.tokenizer.set_target_lang("tel")
+model.load_adapter("tel")
+```
+
+The exact API must match the pinned Transformers version.
+
+The project must record:
+
+```text
+model name
+model revision
+language adapter
+Transformers version
+```
+
+Reference:
+
+https://huggingface.co/facebook/mms-1b-all
+
+---
+
+# APPENDIX E — CTC ALIGNMENT IMPLEMENTATION REQUIREMENTS
+
+The internal CTC aligner must be independent of the model loader so it can be unit tested with synthetic emissions.
+
+Required capabilities:
+
+1. Reference token sequence construction.
+2. Expanded CTC state sequence.
+3. Blank states.
+4. Stay transitions.
+5. Advance transitions.
+6. Correct handling of repeated adjacent labels.
+7. Dynamic-programming/Viterbi score tracking.
+8. Backtracking.
+9. Token span extraction.
+10. Frame-to-time conversion.
+11. Path-derived score calculation.
+12. Explicit failure if the target sequence cannot fit in the available frames.
+
+The implementation must be deterministic given identical emissions, tokens, model revision, configuration, and input audio.
+
+The implementation must not call a deprecated high-level forced-alignment helper as its only alignment mechanism.
+
+---
+
+# APPENDIX F — FINAL CHRONOLOGY ALGORITHM
+
+The chronology correction policy is intentionally conservative.
+
+## F.1 Intra-chunk
+
+For words in reference order:
+
+```text
+word[n].start_ms >= word[n-1].start_ms
+```
+
+and normally:
+
+```text
+word[n].end_ms >= word[n-1].end_ms
+```
+
+A violation is first classified:
+
+```text
+same-token duplicate?
+overlap candidate?
+true reference-order failure?
+```
+
+If it is a duplicate candidate, select the correct provenance winner.
+
+If it is a true reference-order violation, retry/re-align the chunk.
+
+## F.2 Cross-chunk
+
+At every adjacent chunk boundary:
+
+```text
+last accepted word of chunk N
+        <=
+first accepted word of chunk N+1
+```
+
+If overlapping context generated duplicate observations of the same reference word, keep the best candidate using:
+
+1. logical-region inclusion;
+2. stronger score;
+3. closer source-LRC anchor relationship;
+4. narrower unnecessary context dependence.
+
+## F.3 Global
+
+After all chunk candidates are resolved, validate the entire song sequence.
+
+No exporter is invoked until the canonical sequence passes global chronology.
+
+## F.4 Never sort independent timestamps
+
+This is forbidden:
+
+```python
+timestamps.sort()
+```
+
+when timestamps are separated from their lexical items.
+
+Any corrective operation must modify the candidate word object that owns the timestamp.
+
+---
+
+# APPENDIX G — FINAL BLANK-MARKER ALGORITHM
+
+Suppose the LRC contains:
+
+```text
+line N starts at 230000 ms
+blank marker at 272300 ms
+next line starts at 302000 ms
+```
+
+The blank interval should become a high-priority no-new-lyric-start region.
+
+A candidate word:
+
+```text
+start = 271900
+end   = 272760
+```
+
+is not automatically discarded because the onset is before the blank marker. Instead:
+
+- retain the canonical span if acoustic evidence supports it;
+- mark a boundary-crossing diagnostic;
+- prevent later lyric words from starting inside the blank region;
+- ensure the next lyric line begins in the correct subsequent region.
+
+A candidate word:
+
+```text
+start = 272500
+```
+
+is invalid under the blank-region constraint because its onset occurs in the structural blank interval.
+
+The affected chunk should be re-aligned with the blank marker as a hard logical boundary.
+
+---
+
+# APPENDIX H — FINAL ERROR TAXONOMY
+
+The project should distinguish:
+
+```text
+SOURCE / INVENTORY
+MP3_MISSING
+LRC_MISSING
+JSON_MISSING
+JSON_INVALID
+MP3_INVALID
+LRC_INVALID
+
+AUDIO
+AUDIO_DECODE_FAILED
+AUDIO_DURATION_MISMATCH
+
+DEMUCS
+DEMUCS_LOAD_FAILED
+DEMUCS_INFERENCE_FAILED
+DEMUCS_OOM
+VOCALS_INVALID
+
+ACTIVITY
+VAD_FAILED
+ACTIVITY_ANALYSIS_FAILED
+
+TEXT
+NORMALIZATION_FAILED
+TOKENIZATION_FAILED
+UNSUPPORTED_REFERENCE
+
+MMS
+MMS_LOAD_FAILED
+MMS_INFERENCE_FAILED
+MMS_OOM
+CUDA_UNAVAILABLE
+
+ALIGNMENT
+CTC_ALIGNMENT_FAILED
+CHUNK_LOW_CONFIDENCE
+CHUNK_CHRONOLOGY_FAILED
+CHUNK_ANCHOR_FAILED
+
+MERGE
+OVERLAP_CONFLICT
+GLOBAL_CHRONOLOGY_FAILED
+BLANK_MARKER_START_VIOLATION
+ANCHOR_DRIFT
+
+OUTPUT
+LRC_GENERATION_FAILED
+SYLT_EMBED_FAILED
+MP3_VALIDATION_FAILED
+JSON_WRITE_FAILED
+FINAL_PROMOTION_FAILED
+SOURCE_MODIFIED
+```
+
+The error code should identify the real failed subsystem. A final serializer should not mask an earlier alignment failure with a generic file-format message.
+
+---
+
+# APPENDIX I — FIELD RUN INTERPRETATION GUIDE
+
+When a run reports:
+
+```text
+finished = X
+skipped = Y
+failed = Z
+```
+
+interpret them as:
+
+- `finished`: final output package exists and passed the configured output gates.
+- `skipped`: existing valid work was reused or a skip condition was intentionally applied.
+- `failed`: the song could not reach the final output state.
+
+A high skip count during a recovery run is not automatically bad. It usually indicates idempotent reuse.
+
+A high failure count with the exact same error code across many songs usually indicates a shared pipeline defect and should trigger investigation of the common module rather than song-specific tuning.
+
+---
+
+# APPENDIX J — ACCEPTANCE CRITERIA FOR DECLARING PHASE 2 READY FOR THE FULL CORPUS
+
+The project is not considered production-ready until all of the following have been demonstrated on representative songs:
+
+1. MP3/LRC/JSON basename matching.
+2. Full JSON preservation.
+3. MP3 metadata preservation.
+4. Windows FFmpeg decode success.
+5. CUDA-enabled PyTorch verification.
+6. Demucs CUDA execution.
+7. MMS CUDA execution.
+8. Telugu adapter loading.
+9. Real CTC forced alignment.
+10. Same-chunk chronology repair.
+11. Cross-chunk chronology repair.
+12. Blank-marker handling.
+13. LRC export.
+14. SYLT export.
+15. Final MP3 reopening.
+16. Final JSON reopening.
+17. Source-file hash stability.
+18. Resume after interruption.
+19. Retry after chunk failure.
+20. No repeat model download across songs.
+21. No accidental CPU-only large-batch execution.
+22. Final `songs/final/` package correctness.
+
+---
+
+# APPENDIX K — REFERENCE SOURCES USED IN THIS CONSOLIDATED PLAN
+
+## MMS
+
+Meta MMS model card and usage:
+
+https://huggingface.co/facebook/mms-1b-all
+
+## Hugging Face cache
+
+https://huggingface.co/docs/huggingface_hub/main/package_reference/environment_variables
+
+https://huggingface.co/docs/hub/local-cache
+
+## Demucs Windows/GPU behavior
+
+https://github.com/facebookresearch/demucs/blob/main/docs/windows.md
+
+https://github.com/facebookresearch/demucs/blob/main/README.md
+
+## TorchAudio / alignment lifecycle
+
+The implementation intentionally isolates CTC alignment so it is not coupled to deprecated high-level forced-alignment convenience APIs. Pin the actual runtime environment and keep the aligner independent.
+
+---
+
+# APPENDIX L — FINAL OPERATIONAL COMMAND SEQUENCE
+
+## L.1 First setup
+
+```powershell
+python --version
+python main.py --doctor
+nvidia-smi
+```
+
+## L.2 Verify CUDA directly
+
+```powershell
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('CUDA runtime:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE')"
+```
+
+## L.3 Scan only
+
+```powershell
+python main.py --scan-only
+```
+
+## L.4 Dry run
+
+```powershell
+python main.py --dry-run
+```
+
+## L.5 One-song production test
+
+```powershell
+python main.py --song "001_Gelupu Thalupule_Mani Sharma, Sreerama Chandra" --debug
+```
+
+At the same time:
+
+```powershell
+nvidia-smi -l 1
+```
+
+## L.6 Failed-song recovery
+
+```powershell
+python main.py --failed --debug
+```
+
+## L.7 Full batch
+
+```powershell
+python main.py --all
+```
+
+## L.8 Keep debug artifacts
+
+```powershell
+python main.py --all --keep-temp --debug
+```
+
+## L.9 Recovery after interruption
+
+```powershell
+python main.py --recover
+python main.py --all
+```
+
+## L.10 Database backup
+
+```powershell
+python main.py --backup-db db/phase2_backup.sqlite
+```
+
+---
+
+# APPENDIX M — FINAL DO-NOT-DO LIST
+
+Never:
+
+```text
+- modify files inside songs/original/
+- delete original MP3 metadata to simplify embedding
+- replace the original JSON with a newly constructed minimal JSON
+- assume embedded lyrics exist
+- download the MMS model per song
+- silently fall back to CPU for a long production batch
+- use plain ASR argmax offsets as forced alignment
+- sort timestamps away from their word objects
+- let an LRC serializer become the canonical timing engine
+- treat every VAD non-speech region as confirmed instrumental
+- reject a song solely because lyrics end before the audio ends
+- require the last lyric timestamp to be within ±10% of total duration
+- let chunk overlap duplicate final words
+- let a mutable candidate object be modified repeatedly across retry passes
+- write final files directly before validation
+- write the original JSON or LRC in place
+- reintroduce reel/hook-selection functionality into this project
+```
+
+---
+
+# APPENDIX N — FINAL ONE-PARAGRAPH SYSTEM DEFINITION
+
+Phase 2 is a standalone, non-destructive Telugu word-level lyric synchronisation system that reads basename-matched MP3/LRC/JSON packages from `songs/original`, preserves all existing song metadata and cumulative JSON information, decodes and vocal-isolates the audio, uses LRC timestamps and blank markers as coarse structural anchors, normalizes Telugu reversibly, creates overlapping reference-aware chunks, generates Telugu MMS frame-level emissions using the NVIDIA GPU where available, performs genuine CTC reference forced alignment against the supplied LRC text, converts token spans into original-word start/end timings, resolves intra-chunk and inter-chunk chronology without blind timestamp sorting, validates anchor and blank-marker consistency, emits one final word-level LRC, injects only a dedicated Phase 2 word-level SYLT into a copy of the original MP3, updates the original JSON through an additive `phase2` namespace, validates all three outputs, and atomically promotes them as `songs/final/SongName.mp3`, `songs/final/SongName.lrc`, and `songs/final/SongName.json`. The system is resumable, idempotent, CUDA-aware, model-cache-aware, Windows-safe for FFmpeg temporary WAV generation, and explicitly excludes reel creation and hook selection.
 
